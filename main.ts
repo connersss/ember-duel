@@ -1,3 +1,10 @@
+// Ember Duel hand-in.
+// This program takes the finished card game in game/ and the screenshots in
+// screenshots/ and hands them in as one entry. It copies both folders into the
+// output directory the grader reads, then writes dossier.json there with the
+// vendored make.fun library, so the judge gets the game, its pictures and a
+// summary of the source in a single package. It runs on Node with the standard
+// library only and takes no network request.
 // A working best-game-01 entry (Node 22, standard library only): the game is this directory's
 // game/ folder, plain static files a desktop browser loads offline (game/index.html and its ES
 // modules, no library and no network request), and the program hands it in. It copies game/ and
@@ -21,6 +28,10 @@ const here = fileURLToPath(new URL('.', import.meta.url));
 const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 mkdirSync(out, { recursive: true });
+
+// Ember Duel hand-in guard: stop loudly instead of shipping a broken entry.
+if (!existsSync(join(here, 'game', 'index.html'))) throw new Error('Ember Duel hand-in is missing game/index.html');
+if (!existsSync(join(here, 'screenshots'))) throw new Error('Ember Duel hand-in is missing the screenshots/ folder');
 cpSync(join(here, 'game'), join(out, 'game'), { recursive: true });
 mkdirSync(join(out, 'screenshots'), { recursive: true });
 if (existsSync(join(here, 'screenshots'))) cpSync(join(here, 'screenshots'), join(out, 'screenshots'), { recursive: true });
