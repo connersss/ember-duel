@@ -1,124 +1,179 @@
-// The game's rules and state, with no drawing and no browser in it: the player's paddle, the
-// pool of falling blocks and coins, spawning, collisions, score, lives and level. step() advances
-// one fixed step and returns what happened as bit flags, so the caller can react without the
-// world knowing about screens or sound. Nothing here allocates after createWorld returns.
-import { BLOCK, COIN, FIELD, LEVEL, LIVES, PLAYER, POOL_SIZE } from './config.js';
+// Ember Duel: the duel itself. One job: rules and turn flow.
+import { makeSide, drawCards } from './deck.js';
+import { mulberry32 } from './random.js';
+import { START_HAND } from './config.js';
+import { chooseMoves } from './ai.js';
 
-export const KIND_BLOCK = 0;
-export const KIND_COIN = 1;
-
-export const EVENT_HIT = 1;
-export const EVENT_COIN = 2;
-export const EVENT_OVER = 4;
-
-function overlaps(a, b) {
-  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+export function createWorld(seed) {
+  return {
+    seed,
+    rng: mulberry32(seed),
+    screen: 'title',
+    turn: 1,
+    phase: 'player',
+    player: null,
+    enemy: null,
+    log: [],
+    floats: [],
+    playAnim: null,
+    aiQueue: [],
+    aiTimer: 0,
+    confetti: [],
+    frozen: false,
+    hoverCard: -1,
+    message: 'Click a card to play it. End your turn when you are done.',
+    over: false,
+  };
 }
 
-export function createWorld(random) {
-  const player = { x: 0, y: FIELD.groundY - PLAYER.height, width: PLAYER.width, height: PLAYER.height, invulnerable: 0 };
-  const items = [];
-  for (let index = 0; index < POOL_SIZE; index += 1) {
-    items.push({ active: false, kind: KIND_BLOCK, x: 0, y: 0, width: 0, height: 0, speed: 0 });
+export function startGame(world) {
+  world.rng = mulberry32(world.seed);
+  world.player = makeSide(world.rng);
+  world.enemy = makeSide(world.rng);
+  drawCards(world.player, START_HAND);
+  drawCards(world.enemy, START_HAND);
+  world.turn = 1;
+  world.phase = 'player';
+  world.screen = 'play';
+  world.over = false;
+  world.log = ['The duel begins. Your move, duellist.'];
+  world.floats = [];
+  world.playAnim = null;
+  world.aiQueue = [];
+  world.confetti = [];
+  beginTurn(world, world.player);
+}
+
+function embersForTurn(turn) {
+  return Math.min(10, turn + 2);
+}
+
+function beginTurn(world, side) {
+  side.block = 0;
+  side.embers = embersForTurn(world.turn);
+  drawCards(side, 1);
+}
+
+export function canPlayCard(world, card) {
+  return world.screen === 'play' && world.phase === 'player' && !world.over
+    && card.cost <= world.player.embers;
+}
+
+export function dealDamage(world, side, amount, x, y) {
+  const absorbed = Math.min(side.block, amount);
+  side.block -= absorbed;
+  const through = amount - absorbed;
+  side.life -= through;
+  world.floats.push({ x, y, text: `-${through}`, color: '#ff5a3c', t: 0, big: true });
+  if (absorbed > 0) world.floats.push({ x, y: y + 26, text: `blocked ${absorbed}`, color: '#9fd8ff', t: 0, big: false });
+  if (side.life <= 0) side.life = 0;
+}
+
+export function healSide(world, side, amount, x, y) {
+  const healed = Math.min(side.maxLife - side.life, amount);
+  side.life += healed;
+  if (healed > 0) world.floats.push({ x, y, text: `+${healed}`, color: '#7ddc7d', t: 0, big: true });
+}
+
+export function applyCard(world, side, foe, card, fx, fy) {
+  side.embers -= card.cost;
+  const fromHand = side.hand.indexOf(card);
+  if (fromHand >= 0) side.hand.splice(fromHand, 1);
+  side.discard.push(card);
+  world.playAnim = { card, who: side === world.player ? 'player' : 'enemy', t: 0 };
+  if (card.kind === 'damage') dealDamage(world, foe, card.power, fx, fy);
+  if (card.kind === 'damage-draw') { dealDamage(world, foe, card.power, fx, fy); drawCards(side, 1); }
+  if (card.kind === 'block') { side.block += card.power; world.floats.push({ x: fx, y: fy, text: `+${card.power} block`, color: '#9fd8ff', t: 0, big: true }); }
+  if (card.kind === 'heal') healSide(world, side, card.power, fx, fy);
+  if (card.kind === 'heal-draw') { healSide(world, side, card.power, fx, fy); drawCards(side, 1); }
+  if (card.kind === 'draw') drawCards(side, card.power);
+  const who = side === world.player ? 'You play' : 'Cinder plays';
+  world.log.push(`${who} ${card.name}.`);
+  if (world.log.length > 3) world.log.shift();
+  checkEnd(world);
+}
+
+export function playPlayerCard(world, handIndex) {
+  if (world.phase !== 'player' || world.screen !== 'play' || world.over) return false;
+  const card = world.player.hand[handIndex];
+  if (!card || card.cost > world.player.embers) return false;
+  applyCard(world, world.player, world.enemy, card, 640, 330);
+  return true;
+}
+
+export function endPlayerTurn(world) {
+  if (world.phase !== 'player' || world.screen !== 'play' || world.over) return;
+  world.phase = 'ai';
+  world.enemy.block = 0;
+  world.enemy.embers = embersForTurn(world.turn);
+  drawCards(world.enemy, 1);
+  world.aiQueue = chooseMoves(world.enemy, world.player, world.rng);
+  world.aiTimer = 0.7;
+  world.message = 'Cinder is thinking…';
+}
+
+function checkEnd(world) {
+  if (world.over) return;
+  if (world.enemy.life <= 0) {
+    world.over = true;
+    world.screen = 'win';
+    world.message = 'Cinder is beaten. The embers are yours.';
+    burstConfetti(world);
+  } else if (world.player.life <= 0) {
+    world.over = true;
+    world.screen = 'loss';
+    world.message = 'Your embers fade. Cinder takes the table.';
   }
-  const state = { player, items, score: 0, lives: LIVES, level: 1, elapsed: 0, blockTimer: 0, coinTimer: 0 };
+}
 
-  function reset() {
-    player.x = (FIELD.width - player.width) / 2;
-    player.invulnerable = 0;
-    for (const item of items) item.active = false;
-    state.score = 0;
-    state.lives = LIVES;
-    state.level = 1;
-    state.elapsed = 0;
-    state.blockTimer = BLOCK.interval;
-    state.coinTimer = COIN.interval;
+function burstConfetti(world) {
+  const colors = ['#e8b93c', '#d8442e', '#2f8fe0', '#3da33d', '#f6efdc'];
+  for (let i = 0; i < 90; i += 1) {
+    world.confetti.push({
+      x: 80 + world.rng() * 1120,
+      y: -20 - world.rng() * 160,
+      vx: (world.rng() - 0.5) * 60,
+      vy: 90 + world.rng() * 140,
+      size: 6 + world.rng() * 8,
+      color: colors[i % colors.length],
+      rot: world.rng() * Math.PI,
+      vr: (world.rng() - 0.5) * 4,
+    });
   }
+}
 
-  function freeItem() {
-    for (let index = 0; index < items.length; index += 1) if (!items[index].active) return items[index];
-    return null;
+export function update(world, dt) {
+  for (let i = world.floats.length - 1; i >= 0; i -= 1) {
+    world.floats[i].t += dt;
+    if (world.floats[i].t > 1.1) world.floats.splice(i, 1);
   }
-
-  function spawnBlock() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_BLOCK;
-    item.width = BLOCK.minWidth + random() * (BLOCK.maxWidth - BLOCK.minWidth);
-    item.height = BLOCK.height;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = BLOCK.speed + BLOCK.speedPerLevel * (state.level - 1) + random() * BLOCK.speedJitter;
+  if (world.playAnim) {
+    world.playAnim.t += dt;
+    if (world.playAnim.t > 0.9) world.playAnim = null;
   }
-
-  function spawnCoin() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_COIN;
-    item.width = COIN.size;
-    item.height = COIN.size;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = COIN.speed + COIN.speedPerLevel * (state.level - 1);
+  for (const c of world.confetti) {
+    c.y += c.vy * dt;
+    c.x += c.vx * dt;
+    c.rot += c.vr * dt;
+    if (c.y > 820) { c.y = -20; c.x = 80 + world.rng() * 1120; }
   }
-
-  function blockInterval() {
-    return Math.max(BLOCK.minInterval, BLOCK.interval * BLOCK.intervalScale ** (state.level - 1));
-  }
-
-  /**
-   * One fixed step. `direction` is -1, 0 or 1 (left, still, right). With `harmless` set (the title
-   * screen's backdrop) things fall but nothing touches the player and nothing scores.
-   */
-  function step(dt, direction, harmless) {
-    let events = 0;
-    state.elapsed += dt;
-    state.level = Math.min(LEVEL.max, 1 + Math.floor(state.elapsed / LEVEL.seconds));
-
-    player.x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * dt));
-    if (player.invulnerable > 0) player.invulnerable = Math.max(0, player.invulnerable - dt);
-
-    state.blockTimer -= dt;
-    if (state.blockTimer <= 0) {
-      spawnBlock();
-      state.blockTimer += blockInterval();
-    }
-    state.coinTimer -= dt;
-    if (state.coinTimer <= 0) {
-      spawnCoin();
-      state.coinTimer += COIN.interval + random() * COIN.intervalJitter;
-    }
-
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      item.y += item.speed * dt;
-      if (item.y > FIELD.groundY) {
-        item.active = false;
-        if (item.kind === KIND_BLOCK && !harmless) state.score += BLOCK.dodgePoints;
-        continue;
-      }
-      if (harmless || !overlaps(item, player)) continue;
-      if (item.kind === KIND_COIN) {
-        item.active = false;
-        state.score += COIN.points;
-        events |= EVENT_COIN;
-      } else if (player.invulnerable === 0) {
-        item.active = false;
-        state.lives -= 1;
-        player.invulnerable = PLAYER.invulnerable;
-        events |= EVENT_HIT;
-        if (state.lives === 0) {
-          events |= EVENT_OVER;
-          break;
+  if (world.frozen || world.over || world.screen !== 'play') return;
+  if (world.phase === 'ai') {
+    world.aiTimer -= dt;
+    if (world.aiTimer <= 0) {
+      const next = world.aiQueue.shift();
+      if (next) {
+        const idx = world.enemy.hand.indexOf(next);
+        if (idx >= 0 && next.cost <= world.enemy.embers) {
+          applyCard(world, world.enemy, world.player, next, 640, 470);
         }
+        world.aiTimer = 0.75;
+      } else {
+        world.turn += 1;
+        world.phase = 'player';
+        beginTurn(world, world.player);
+        world.message = `Turn ${world.turn} — your move.`;
       }
     }
-    return events;
   }
-
-  reset();
-  return { state, reset, step };
 }
